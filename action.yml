@@ -1,0 +1,24 @@
+name: "Node Package Action"
+description: "A package that tars up node files and depends and uploads to s3."
+branding:
+  icon: "box"
+  color: "blue"
+inputs:
+  cwd:
+    description: "Current working directory for tar command"
+    required: false
+  files:
+    description: "List of files or folders to archive"
+    required: true
+  shrinkwrap:
+    description: "npm shrinkwrap file to sync to private mirror"
+    required: false
+  s3prefix:
+    description: "S3 bucket and optional path prefix, no trailing /"
+    required: true
+outputs:
+  out_file:
+    description: "tar file if successful"
+runs:
+  using: "node16"
+  main: "dist/index.js"

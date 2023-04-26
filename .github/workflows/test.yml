@@ -1,0 +1,37 @@
+name: Node package action tester
+
+on:
+  push:
+    branches: [ "master" ]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Configure AWS credentials from Test account
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-region: us-west-2
+          role-to-assume: ${{ secrets.AWS_ROLE }}
+          role-session-name: githubsession
+      - uses: actions/checkout@v3
+      - name: Package and and upload
+        uses: ./ # Uses an action in the root directory
+        id: package
+        with:
+          cwd: ./test
+          files: ./
+          shrinkwrap: npm-shrinkwrap.json
+          s3prefix: ${{ secrets.AWS_BUCKET_PREFIX }}
+      - name: Get the output
+        run: echo "The output was ${{ steps.package.outputs.out_file }}"
+      - uses: actions/upload-artifact@v1
+        with:
+          name: output.tar.gz
+          path: ${{ steps.package.outputs.out_file }}
