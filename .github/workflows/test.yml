@@ -29,6 +29,7 @@ jobs:
           files: ./
           shrinkwrap: npm-shrinkwrap.json
           s3prefix: ${{ secrets.AWS_BUCKET_PREFIX }}
+          s3npmPrefix: ${{ secrets.AWS_BUCKET_PREFIX }}/npm
       - name: Get the output
         run: echo "The output was ${{ steps.package.outputs.out_file }}"
       - uses: actions/upload-artifact@v1

@@ -16,6 +16,9 @@ inputs:
   s3prefix:
     description: "S3 bucket and optional path prefix, no trailing /"
     required: true
+  s3npmPrefix:
+    description: "S3 bucket and path for npm, defaults to s3prefix"
+    required: false
 outputs:
   out_file:
     description: "tar file if successful"
