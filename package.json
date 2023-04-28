@@ -1,6 +1,6 @@
 {
   "name": "node-package-action",
-  "version": "0.0.1",
+  "version": "1.0.1",
   "description": "Node package action",
   "author": "jim@blueskylabs.com",
   "private": true,
