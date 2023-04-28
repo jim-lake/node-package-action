@@ -50614,11 +50614,12 @@ const npm_dir = path.join(temp_dir, 'npm');
 const out_file = path.join(temp_dir, context.sha + '.tar.gz');
 const latest_file = path.join(temp_dir, 'LATEST');
 
-let cwd, files, shrinkwrap;
+let cwd, files, shrinkwrap, s3prefix, s3npmPrefix;
 try {
   cwd = core.getInput('cwd');
   shrinkwrap = core.getInput('shrinkwrap');
   s3prefix = core.getInput('s3prefix');
+  s3npmPrefix = core.getInput('s3npmPrefix') || s3prefix;
   files = core
     .getInput('files', { required: true })
     .split('\n')
@@ -50652,11 +50653,13 @@ try {
 }
 
 function handleCode(done) {
+  const commit_file = path.join(cwd, '.git_commit_hash');
+  fs.writeFileSync(commit_file, context.sha);
   asyncSeries(
     [
       (done) => {
         const list = Array.isArray(files) ? files : [files];
-        const opts = { cwd, gzip: true, file: out_file };
+        const opts = { cwd, gzip: true, file: out_file, filter: tarFilter };
         tar.c(opts, list).then(
           () => {
             done();
@@ -50711,7 +50714,7 @@ function handleShrinkwrap(done) {
       },
       (done) => asyncEachLimit(list, EACH_LIMIT, handleUrl, done),
       (done) => {
-        const cmd = `aws s3 sync ${npm_dir} s3://${s3prefix}/npm/`;
+        const cmd = `aws s3 sync ${npm_dir} s3://${s3npmPrefix}/`;
         core.info('cmd: ' + cmd);
         const proc = exec(cmd, (err) => {
           if (err) {
@@ -50751,6 +50754,10 @@ function updateLatest(done) {
   });
   proc.stdout.pipe(process.stdout);
   proc.stderr.pipe(process.stderr);
+}
+function tarFilter(path, stat) {
+  const is_git = path && path.indexOf('.git/') === 0;
+  return !is_git;
 }
 
 })();
