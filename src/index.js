@@ -89,59 +89,61 @@ function handleCode(done) {
 }
 
 function handleShrinkwrap(done) {
-  let list = [];
-  asyncSeries(
-    [
-      (done) => fs.mkdir(npm_dir, done),
-      (done) => {
-        try {
-          const shrink_path = path.join(cwd, shrinkwrap);
-          const file_contents = fs.readFileSync(shrink_path);
-          const json = JSON.parse(file_contents);
-          if (json && json.packages) {
-            const map = {};
-            Object.keys(json.packages).forEach((key) => {
-              const value = json.packages[key];
-              if (key && value.resolved) {
-                map[value.resolved] = true;
-              }
-            });
-            list = Object.keys(map);
-          }
-          done();
-        } catch (err) {
-          done(err);
+  try {
+    let list = [];
+    const shrink_path = path.join(cwd, shrinkwrap);
+    const file_contents = fs.readFileSync(shrink_path);
+    const json = JSON.parse(file_contents);
+    if (json && json.packages) {
+      const map = {};
+      Object.keys(json.packages).forEach((key) => {
+        const value = json.packages[key];
+        if (key && value.resolved) {
+          map[value.resolved] = true;
         }
-      },
-      (done) => asyncEachLimit(list, EACH_LIMIT, handleUrl, done),
-      (done) => {
-        const cmd = `aws s3 sync ${npm_dir} s3://${s3npmPrefix}/`;
-        core.info('cmd: ' + cmd);
-        const proc = exec(cmd, (err) => {
-          if (err) {
-            core.error('handleShrinkwrap: err:' + err);
-          }
-          done(err);
-        });
-        proc.stdout.pipe(process.stdout);
-        proc.stderr.pipe(process.stderr);
-      },
-    ],
-    done
-  );
+      });
+      list = Object.keys(map);
+    }
+    asyncSeries(
+      [
+        (done) => fs.mkdir(npm_dir, done),
+        (done) => asyncEachLimit(list, EACH_LIMIT, handleUrl, done),
+        (done) => {
+          const cmd = `aws s3 sync ${npm_dir} s3://${s3npmPrefix}/`;
+          core.info('cmd: ' + cmd);
+          const proc = exec(cmd, (err) => {
+            if (err) {
+              core.error('handleShrinkwrap: err:' + err);
+            }
+            done(err);
+          });
+          proc.stdout.pipe(process.stdout);
+          proc.stderr.pipe(process.stderr);
+        },
+      ],
+      done
+    );
+  } catch (e) {
+    done(e);
+  }
 }
 function handleUrl(url, done) {
-  const url_path = url.replace(/http?s:\/\/[^/]*/, '');
-  const dest_path = path.join(npm_dir, url_path);
-  const dir = path.dirname(dest_path);
-  fs.mkdirSync(dir, { recursive: true });
-  const output = fs.createWriteStream(dest_path);
-  const r = request(url).pipe(output);
-  r.on('finish', () => done());
-  r.on('error', (err) => {
-    core.info('handleUrl err: ' + err);
-    done(err);
-  });
+  if (url.indexOf('http') === 0) {
+    const url_path = url.replace(/http?s:\/\/[^/]*/, '');
+    const dest_path = path.join(npm_dir, url_path);
+    const dir = path.dirname(dest_path);
+    fs.mkdirSync(dir, { recursive: true });
+    const output = fs.createWriteStream(dest_path);
+    const r = request(url).pipe(output);
+    r.on('finish', () => done());
+    r.on('error', (err) => {
+      core.info('handleUrl err: ' + err);
+      done(err);
+    });
+  } else {
+    core.info('handleUrl: skip: ' + url);
+    done();
+  }
 }
 function updateLatest(done) {
   fs.writeFileSync(latest_file, context.sha);
