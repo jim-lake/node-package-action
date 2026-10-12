@@ -19,9 +19,22 @@ inputs:
   s3npmPrefix:
     description: "S3 bucket and path for npm, defaults to s3prefix"
     required: false
+  rewriteShrinkwrap:
+    description: "Rewrite the shrinkwrap so resolved urls point at s3BaseUrl, and upload it. Requires s3BaseUrl."
+    required: false
+    default: "false"
+  s3BaseUrl:
+    description: "Public https base url for the npm mirror (e.g. https://bucket.s3.amazonaws.com/npm), used when rewriteShrinkwrap is true"
+    required: false
+  omitDev:
+    description: "Skip dev-only dependencies (lockfile entries flagged dev) when mirroring and rewriting"
+    required: false
+    default: "false"
 outputs:
   out_file:
     description: "tar file if successful"
+  shrinkwrap_file:
+    description: "rewritten shrinkwrap file if rewriteShrinkwrap was enabled"
 runs:
-  using: "node16"
-  main: "dist/index.js"
+  using: "node24"
+  main: "dist/index.mjs"

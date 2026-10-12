@@ -1,24 +1,28 @@
 {
   "name": "node-package-action",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Node package action",
   "author": "jim@blueskylabs.com",
   "private": true,
   "license": "MIT",
-  "main": "dist/index.js",
+  "type": "module",
+  "main": "dist/index.mjs",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
-    "build": "ncc build ./src/index.js",
-    "pretty": "prettier --write src/*.js"
+    "build": "ncc build ./src/index.mjs",
+    "test": "node --test test/helpers.test.mjs",
+    "test:e2e": "node --env-file=.env --test test/e2e.test.mjs test/omitdev.test.mjs",
+    "test:all": "node --test test/helpers.test.mjs && node --env-file=.env --test test/e2e.test.mjs test/omitdev.test.mjs",
+    "pretty": "prettier --write src/*.mjs"
   },
   "dependencies": {
-    "@actions/core": "1.10.0",
-    "@actions/glob": "0.4.0",
-    "@actions/github": "5.0.0",
-    "async": "3.2.0",
-    "request": "2.88.2",
-    "tar": "6.1.11"
+    "@actions/core": "3.0.1",
+    "@actions/github": "9.1.1",
+    "tar": "7.5.22"
   },
   "devDependencies": {
-    "@vercel/ncc": "0.36.1"
+    "@vercel/ncc": "0.45.0"
   }
 }

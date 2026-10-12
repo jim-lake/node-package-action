@@ -15,24 +15,24 @@ jobs:
       contents: read
     steps:
       - name: Configure AWS credentials from Test account
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: us-west-2
           role-to-assume: ${{ secrets.AWS_ROLE }}
           role-session-name: githubsession
-      - uses: actions/checkout@v3
-      - name: Package and and upload
+      - uses: actions/checkout@v4
+      - name: Package and upload
         uses: ./ # Uses an action in the root directory
         id: package
         with:
-          cwd: ./test
+          cwd: ./test/fixtures/e2e
           files: ./
           shrinkwrap: npm-shrinkwrap.json
           s3prefix: ${{ secrets.AWS_BUCKET_PREFIX }}
           s3npmPrefix: ${{ secrets.AWS_BUCKET_PREFIX }}/npm
       - name: Get the output
         run: echo "The output was ${{ steps.package.outputs.out_file }}"
-      - uses: actions/upload-artifact@v1
+      - uses: actions/upload-artifact@v4
         with:
           name: output.tar.gz
           path: ${{ steps.package.outputs.out_file }}
