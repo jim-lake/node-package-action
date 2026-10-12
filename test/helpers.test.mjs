@@ -8,7 +8,7 @@ process.env.RUNNER_TEMP = process.env.RUNNER_TEMP || os.tmpdir();
 process.env.GITHUB_SHA = process.env.GITHUB_SHA || 'testsha';
 
 const { isHttpTarball, isGitSpec, verifyIntegrity, isDevOnly } = await import(
-  '../src/index.mjs'
+  '../src/node-package-action.ts'
 );
 
 test('isHttpTarball matches http and https', () => {

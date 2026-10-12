@@ -37,4 +37,4 @@ outputs:
     description: "rewritten shrinkwrap file if rewriteShrinkwrap was enabled"
 runs:
   using: "node24"
-  main: "dist/index.mjs"
+  main: "dist/node-package-action.mjs"

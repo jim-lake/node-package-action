@@ -6,16 +6,19 @@
   "private": true,
   "license": "MIT",
   "type": "module",
-  "main": "dist/index.mjs",
+  "main": "dist/node-package-action.mjs",
   "engines": {
     "node": ">=24"
   },
   "scripts": {
-    "build": "ncc build ./src/index.mjs",
+    "build": "rollup -c",
+    "typecheck": "tsc --noEmit",
+    "ts:check": "tsc --noEmit",
+    "lint": "eslint . --fix",
     "test": "node --test test/helpers.test.mjs",
     "test:e2e": "node --env-file=.env --test test/e2e.test.mjs test/omitdev.test.mjs",
     "test:all": "node --test test/helpers.test.mjs && node --env-file=.env --test test/e2e.test.mjs test/omitdev.test.mjs",
-    "pretty": "prettier --write src/*.mjs"
+    "pretty": "prettier --write src/*.ts"
   },
   "dependencies": {
     "@actions/core": "3.0.1",
@@ -23,6 +26,21 @@
     "tar": "7.5.22"
   },
   "devDependencies": {
-    "@vercel/ncc": "0.45.0"
+    "@eslint/js": "10.0.1",
+    "@rollup/plugin-commonjs": "29.0.3",
+    "@rollup/plugin-json": "6.1.0",
+    "@rollup/plugin-node-resolve": "16.0.3",
+    "@types/node": "24.19.2",
+    "esbuild": "0.28.2",
+    "eslint": "10.0.1",
+    "globals": "16.4.0",
+    "prettier": "^3.9.10",
+    "rollup": "4.64.5",
+    "rollup-plugin-esbuild": "6.2.1",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.71.2"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
   }
 }

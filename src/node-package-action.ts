@@ -16,7 +16,65 @@ const temp_dir = process.env.RUNNER_TEMP || os.tmpdir();
 const out_file = path.join(temp_dir, context.sha + '.tar.gz');
 const latest_file = path.join(temp_dir, 'LATEST');
 
-async function main() {
+// A single lockfile `packages` entry.
+interface LockfilePackage {
+  resolved?: string;
+  integrity?: string;
+  dev?: boolean;
+  [key: string]: unknown;
+}
+
+// Minimal shape of an npm lockfile (npm-shrinkwrap.json / package-lock.json).
+interface Lockfile {
+  packages?: Record<string, LockfilePackage>;
+  [key: string]: unknown;
+}
+
+// A unique resolved dependency pulled from the lockfile.
+interface MirrorItem {
+  pkgKey: string;
+  pkg: LockfilePackage;
+  resolved: string;
+}
+
+// The outcome of mirroring one dependency: its content-addressed key and the
+// (possibly updated) SRI integrity string.
+interface MirrorResult {
+  key: string;
+  integrity: string;
+}
+
+interface HandleShrinkwrapOptions {
+  cwd: string;
+  shrinkwrap: string;
+  s3npmPrefix: string;
+  rewriteShrinkwrap: boolean;
+  s3BaseUrl: string;
+  omitDev: boolean;
+}
+
+interface HandleCodeOptions {
+  cwd: string;
+  files: string | string[];
+  s3prefix: string;
+}
+
+interface RewriteShrinkwrapOptions {
+  cwd: string;
+  json: Lockfile;
+  shrinkwrap: string;
+  s3BaseUrl: string;
+  mirror_map: Map<string, MirrorResult>;
+}
+
+interface AwsResult {
+  ok: boolean;
+  stdout: string;
+  stderr: string;
+  code: number;
+}
+
+async function main(): Promise<void> {
   const cwd = core.getInput('cwd');
   const shrinkwrap = core.getInput('shrinkwrap');
   const s3prefix = core.getInput('s3prefix');
@@ -55,7 +113,11 @@ async function main() {
 }
 
 // Tar the source tree (excluding .git) and upload it to the code prefix.
-async function handleCode({ cwd, files, s3prefix }) {
+async function handleCode({
+  cwd,
+  files,
+  s3prefix,
+}: HandleCodeOptions): Promise<void> {
   const commit_file = path.join(cwd, '.git_commit_hash');
   await fs.writeFile(commit_file, context.sha);
 
@@ -72,21 +134,27 @@ export async function handleShrinkwrap({
   rewriteShrinkwrap,
   s3BaseUrl,
   omitDev,
-}) {
+}: HandleShrinkwrapOptions): Promise<void> {
   const shrink_path = path.join(cwd, shrinkwrap);
-  const json = JSON.parse(await fs.readFile(shrink_path, 'utf8'));
+  const json = JSON.parse(await fs.readFile(shrink_path, 'utf8')) as Lockfile;
 
   // Collect unique resolved specs, keeping the package metadata for each.
   // When omitDev is set, skip packages that are only reachable through
   // devDependencies (lockfile entries flagged "dev": true). Entries flagged
   // "devOptional" are kept, matching `npm ci --omit=dev`.
-  const items = [];
-  const seen = new Set();
+  const items: MirrorItem[] = [];
+  const seen = new Set<string>();
   if (json && json.packages) {
     for (const [pkgKey, pkg] of Object.entries(json.packages)) {
-      if (!pkg || !pkg.resolved) continue;
-      if (omitDev && isDevOnly(pkg)) continue;
-      if (seen.has(pkg.resolved)) continue;
+      if (!pkg || !pkg.resolved) {
+        continue;
+      }
+      if (omitDev && isDevOnly(pkg)) {
+        continue;
+      }
+      if (seen.has(pkg.resolved)) {
+        continue;
+      }
       seen.add(pkg.resolved);
       items.push({ pkgKey, pkg, resolved: pkg.resolved });
     }
@@ -96,7 +164,7 @@ export async function handleShrinkwrap({
   // bounded concurrency. Each upload skips when the object already exists
   // (identical content => identical key) and verifies the bytes via S3's
   // native sha512 checksum on write.
-  const mirror_map = new Map();
+  const mirror_map = new Map<string, MirrorResult>();
   await mapLimit(items, EACH_LIMIT, async (item) => {
     const result = await mirrorResolved(item, s3npmPrefix);
     if (result) {
@@ -117,12 +185,15 @@ export async function handleShrinkwrap({
 
 // A lockfile entry is dev-only when npm marks it "dev": true, meaning every
 // path that reaches it goes through devDependencies.
-export function isDevOnly(pkg) {
+export function isDevOnly(pkg: LockfilePackage): boolean {
   return pkg.dev === true;
 }
 
 // Classify a resolved spec and mirror it. Returns { key, integrity } or null.
-async function mirrorResolved(item, s3npmPrefix) {
+async function mirrorResolved(
+  item: MirrorItem,
+  s3npmPrefix: string
+): Promise<MirrorResult | null> {
   const url = item.resolved;
   if (isHttpTarball(url)) {
     return mirrorHttpTarball(item, s3npmPrefix);
@@ -134,11 +205,11 @@ async function mirrorResolved(item, s3npmPrefix) {
   return null;
 }
 
-export function isHttpTarball(url) {
+export function isHttpTarball(url: string): boolean {
   return /^https?:\/\//.test(url);
 }
 
-export function isGitSpec(url) {
+export function isGitSpec(url: string): boolean {
   return (
     /^git\+/.test(url) ||
     /^git:\/\//.test(url) ||
@@ -150,7 +221,10 @@ export function isGitSpec(url) {
 // store it content-addressed by its sha512 (<sha512-hex>.tar.gz). The key is
 // derived from the bytes, so it is impossible for the stored object and its
 // integrity to disagree.
-async function mirrorHttpTarball(item, s3npmPrefix) {
+async function mirrorHttpTarball(
+  item: MirrorItem,
+  s3npmPrefix: string
+): Promise<MirrorResult> {
   const url = item.resolved;
 
   const res = await fetch(url);
@@ -169,8 +243,14 @@ async function mirrorHttpTarball(item, s3npmPrefix) {
 // Compare downloaded bytes against a Subresource Integrity string from the
 // lockfile. Checks the strongest algorithm present. Throws on mismatch.
 // A missing/empty integrity is allowed (nothing to verify against).
-export function verifyIntegrity(sri, buf, url) {
-  if (!sri) return;
+export function verifyIntegrity(
+  sri: string | undefined,
+  buf: Buffer,
+  url: string
+): void {
+  if (!sri) {
+    return;
+  }
   // SRI may contain multiple space-separated "<alg>-<base64>" hashes.
   const entries = sri
     .trim()
@@ -181,12 +261,14 @@ export function verifyIntegrity(sri, buf, url) {
         ? null
         : { alg: s.slice(0, dash), b64: s.slice(dash + 1) };
     })
-    .filter(Boolean);
+    .filter((e): e is { alg: string; b64: string } => e !== null);
 
   // Prefer sha512, then sha256, then sha1.
   for (const alg of ['sha512', 'sha256', 'sha1']) {
     const entry = entries.find((e) => e.alg === alg);
-    if (!entry) continue;
+    if (!entry) {
+      continue;
+    }
     const actual = crypto.createHash(alg).update(buf).digest('base64');
     if (actual !== entry.b64) {
       throw new Error(
@@ -204,7 +286,10 @@ export function verifyIntegrity(sri, buf, url) {
 // for the lockfile rewrite. The sha512 is computed once and reused as the hex
 // key, the base64 S3 checksum, and the base64 SRI integrity (all free
 // re-encodings of the same digest).
-async function storeTarball(buf, s3npmPrefix) {
+async function storeTarball(
+  buf: Buffer,
+  s3npmPrefix: string
+): Promise<MirrorResult> {
   const digest = crypto.createHash('sha512').update(buf).digest();
   const hex = digest.toString('hex');
   const b64 = digest.toString('base64');
@@ -218,7 +303,17 @@ async function storeTarball(buf, s3npmPrefix) {
 // head-then-put: skip when the key already exists (content-addressed, so an
 // existing object is byte-identical), otherwise upload with S3's native
 // sha512 checksum so the service verifies the bytes on write.
-async function putContentAddressed({ buf, key, checksumB64, s3npmPrefix }) {
+async function putContentAddressed({
+  buf,
+  key,
+  checksumB64,
+  s3npmPrefix,
+}: {
+  buf: Buffer;
+  key: string;
+  checksumB64: string;
+  s3npmPrefix: string;
+}): Promise<void> {
   const [bucket, ...prefixParts] = s3npmPrefix.split('/');
   const fullKey = [...prefixParts, key].filter(Boolean).join('/');
 
@@ -261,7 +356,10 @@ async function putContentAddressed({ buf, key, checksumB64, s3npmPrefix }) {
 // Pack a git dependency into a tarball via `npm pack`, compute its sha512, and
 // store it content-addressed (<sha512-hex>.tar.gz). There is no pre-existing
 // integrity to verify against, so the computed sha512 is authoritative.
-async function mirrorGitSpec(item, s3npmPrefix) {
+async function mirrorGitSpec(
+  item: MirrorItem,
+  s3npmPrefix: string
+): Promise<MirrorResult> {
   const url = item.resolved;
 
   const pack_dir = await fs.mkdtemp(path.join(temp_dir, 'gitpack-'));
@@ -274,14 +372,14 @@ async function mirrorGitSpec(item, s3npmPrefix) {
       { cwd: temp_dir, maxBuffer: 32 * 1024 * 1024 }
     );
 
-    let filename;
+    let filename: string | undefined;
     try {
       filename = JSON.parse(stdout)[0].filename;
     } catch {
       filename = undefined;
     }
 
-    let packed = filename
+    let packed: string | undefined = filename
       ? path.join(pack_dir, path.basename(filename))
       : undefined;
     if (!packed || !(await exists(packed))) {
@@ -314,16 +412,20 @@ async function rewriteShrinkwrapInPlace({
   shrinkwrap,
   s3BaseUrl,
   mirror_map,
-}) {
+}: RewriteShrinkwrapOptions): Promise<void> {
   const base = s3BaseUrl.replace(/\/+$/, '');
   const rewritten = structuredClone(json);
   let count = 0;
 
   if (rewritten.packages) {
     for (const value of Object.values(rewritten.packages)) {
-      if (!value || !value.resolved) continue;
+      if (!value || !value.resolved) {
+        continue;
+      }
       const info = mirror_map.get(value.resolved);
-      if (!info) continue; // not mirrored (dev-only or unsupported) -> leave as-is
+      if (!info) {
+        continue;
+      } // not mirrored (dev-only or unsupported) -> leave as-is
       value.resolved = base + '/' + info.key;
       if (info.integrity) {
         value.integrity = info.integrity;
@@ -340,7 +442,7 @@ async function rewriteShrinkwrapInPlace({
   core.setOutput('shrinkwrap_file', in_tree_path);
 }
 
-async function updateLatest({ s3prefix }) {
+async function updateLatest({ s3prefix }: { s3prefix: string }): Promise<void> {
   await fs.writeFile(latest_file, context.sha);
   await aws(['s3', 'cp', latest_file, `s3://${s3prefix}/`]);
 }
@@ -348,22 +450,30 @@ async function updateLatest({ s3prefix }) {
 // Run the aws cli with argv (no shell). Returns { ok, stdout, stderr, code }.
 // With { ignoreError: true } a non-zero exit resolves (ok:false) instead of
 // throwing -- used for head-object existence checks.
-async function aws(args, { ignoreError = false } = {}) {
+async function aws(
+  args: string[],
+  { ignoreError = false }: { ignoreError?: boolean } = {}
+): Promise<AwsResult> {
   core.info('aws ' + args.join(' '));
   try {
     const { stdout, stderr } = await execFileAsync('aws', args, {
       maxBuffer: 32 * 1024 * 1024,
     });
-    if (stdout) process.stdout.write(stdout);
-    if (stderr) process.stderr.write(stderr);
+    if (stdout) {
+      process.stdout.write(stdout);
+    }
+    if (stderr) {
+      process.stderr.write(stderr);
+    }
     return { ok: true, stdout, stderr, code: 0 };
-  } catch (err) {
+  } catch (err: unknown) {
     if (ignoreError) {
+      const e = err as { stdout?: string; stderr?: string; code?: number };
       return {
         ok: false,
-        stdout: err.stdout || '',
-        stderr: err.stderr || '',
-        code: typeof err.code === 'number' ? err.code : 1,
+        stdout: e.stdout || '',
+        stderr: e.stderr || '',
+        code: typeof e.code === 'number' ? e.code : 1,
       };
     }
     throw err;
@@ -371,13 +481,19 @@ async function aws(args, { ignoreError = false } = {}) {
 }
 
 // Bounded-concurrency async map. Preserves fail-fast behavior via Promise.all.
-async function mapLimit(items, limit, fn) {
+async function mapLimit<T>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<void>
+): Promise<void> {
   const queue = [...items.entries()];
-  const workers = [];
-  const run = async () => {
+  const workers: Promise<void>[] = [];
+  const run = async (): Promise<void> => {
     for (;;) {
       const next = queue.shift();
-      if (!next) return;
+      if (!next) {
+        return;
+      }
       await fn(next[1], next[0]);
     }
   };
@@ -387,7 +503,7 @@ async function mapLimit(items, limit, fn) {
   await Promise.all(workers);
 }
 
-async function exists(p) {
+async function exists(p: string): Promise<boolean> {
   try {
     await fs.access(p);
     return true;
@@ -396,14 +512,14 @@ async function exists(p) {
   }
 }
 
-function tarFilter(entry) {
+function tarFilter(entry: string): boolean {
   const is_git = entry && entry.indexOf('.git/') === 0;
   return !is_git;
 }
 
 // Only run the action when executed directly (not when imported by tests).
 if (import.meta.main) {
-  main().catch((error) => {
+  main().catch((error: unknown) => {
     core.setFailed(error instanceof Error ? error.message : String(error));
     process.exit(1);
   });

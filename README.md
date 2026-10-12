@@ -34,6 +34,10 @@ untouched dev urls are never fetched.
 Runs on the GitHub Actions **node24** runtime. Uses native `fetch` and
 `async/await`; no `request` or `async` dependencies.
 
+The action source is TypeScript (`src/node-package-action.ts`) and is bundled
+with Rollup + esbuild into a single ESM file (`dist/node-package-action.mjs`)
+with every dependency internalized (only Node builtins stay external).
+
 ## Inputs
 
 | Input               | Required | Description                                                                 |
@@ -59,5 +63,13 @@ Runs on the GitHub Actions **node24** runtime. Uses native `fetch` and
 ```sh
 npm install
 npm test          # unit tests for the pure helpers
-npm run build     # bundles src/index.js into dist/index.js via ncc
+npm run typecheck # type-check with tsc (no emit)
+npm run lint      # eslint over src and tests
+npm run build     # bundles src/node-package-action.ts into
+                  # dist/node-package-action.mjs via rollup + esbuild
 ```
+
+Node 24 runs the `.ts` source directly (native type stripping), so tests import
+`src/node-package-action.ts` without a build step. The `build` script produces
+the committed `dist/node-package-action.mjs` that the action actually runs.
+

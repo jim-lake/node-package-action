@@ -9,12 +9,12 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// RUNNER_TEMP / GITHUB_SHA are read by src/index.mjs at module load; set first.
+// RUNNER_TEMP / GITHUB_SHA are read by the source at module load; set first.
 const RUNNER_TEMP = fs.mkdtempSync(path.join(os.tmpdir(), 'npa-omitdev-'));
 process.env.RUNNER_TEMP = RUNNER_TEMP;
 process.env.GITHUB_SHA = process.env.GITHUB_SHA || 'omitdev-' + Date.now();
 
-const { handleShrinkwrap } = await import('../src/index.mjs');
+const { handleShrinkwrap } = await import('../src/node-package-action.ts');
 
 const FIXTURE_DIR = path.join(__dirname, 'fixtures', 'e2e-omitdev');
 const SHRINKWRAP = 'npm-shrinkwrap.json';
