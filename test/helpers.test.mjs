@@ -7,9 +7,8 @@ import os from 'node:os';
 process.env.RUNNER_TEMP = process.env.RUNNER_TEMP || os.tmpdir();
 process.env.GITHUB_SHA = process.env.GITHUB_SHA || 'testsha';
 
-const { isHttpTarball, isGitSpec, verifyIntegrity, isDevOnly } = await import(
-  '../src/node-package-action.ts'
-);
+const { isHttpTarball, isGitSpec, verifyIntegrity, isDevOnly, parseListPage } =
+  await import('../src/node-package-action.ts');
 
 test('isHttpTarball matches http and https', () => {
   assert.equal(isHttpTarball('https://registry.npmjs.org/x/-/x-1.0.0.tgz'), true);
@@ -69,4 +68,42 @@ test('verifyIntegrity is a no-op when SRI is empty or unknown', () => {
   assert.doesNotThrow(() => verifyIntegrity('', buf, 'u'));
   assert.doesNotThrow(() => verifyIntegrity(undefined, buf, 'u'));
   assert.doesNotThrow(() => verifyIntegrity('md5-abc', buf, 'u'));
+});
+
+test('parseListPage extracts keys and NextToken from a truncated page', () => {
+  // Shape of `s3api list-objects-v2 --output json` when truncated by
+  // --max-items: a top-level Contents array plus a NextToken to resume from.
+  const page = JSON.stringify({
+    Contents: [{ Key: 'a/x.tar.gz' }, { Key: 'a/y.tar.gz' }],
+    NextToken: 'TOKEN123',
+  });
+  const { keys, nextToken } = parseListPage(page);
+  assert.deepEqual(keys, ['a/x.tar.gz', 'a/y.tar.gz']);
+  assert.equal(nextToken, 'TOKEN123');
+});
+
+test('parseListPage returns no token on the final (exhausted) page', () => {
+  const page = JSON.stringify({
+    Contents: [{ Key: 'a/x.tar.gz' }],
+  });
+  const { keys, nextToken } = parseListPage(page);
+  assert.deepEqual(keys, ['a/x.tar.gz']);
+  assert.equal(nextToken, undefined);
+});
+
+test('parseListPage treats an empty-string NextToken as no more pages', () => {
+  const page = JSON.stringify({ Contents: [{ Key: 'k' }], NextToken: '' });
+  assert.equal(parseListPage(page).nextToken, undefined);
+});
+
+test('parseListPage handles an empty mirror and malformed input', () => {
+  assert.deepEqual(parseListPage(JSON.stringify({ RequestCharged: null })), {
+    keys: [],
+    nextToken: undefined,
+  });
+  assert.deepEqual(parseListPage('not json'), {
+    keys: [],
+    nextToken: undefined,
+  });
+  assert.deepEqual(parseListPage(''), { keys: [], nextToken: undefined });
 });

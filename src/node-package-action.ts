@@ -390,8 +390,6 @@ export async function listExistingKeys(
       bucket,
       '--output',
       'json',
-      '--query',
-      'Contents[].Key',
     ];
     if (prefix) {
       args.push('--prefix', prefix + '/');
@@ -399,7 +397,12 @@ export async function listExistingKeys(
     if (token) {
       args.push('--starting-token', token);
     }
-    // --max-items keeps the CLI's own pagination in sync with our token loop.
+    // --max-items bounds how many items the CLI prints before emitting a
+    // NextToken we can resume from. Do NOT add --query here: a JMESPath query
+    // like `Contents[].Key` rewrites the whole response and drops the injected
+    // NextToken field, which silently breaks pagination (the loop would stop
+    // after the first 1000 keys). We parse Contents[].Key + NextToken from the
+    // raw JSON ourselves instead.
     args.push('--max-items', '1000');
 
     const res = await aws(args, { ignoreError: true });
@@ -413,8 +416,7 @@ export async function listExistingKeys(
       return keys;
     }
 
-    // With --query the CLI prints the array of keys; pagination appends a
-    // trailing NextToken object. Parse defensively.
+    // Parse Contents[].Key and NextToken from the raw list-objects-v2 JSON.
     const parsed = parseListPage(res.stdout);
     for (const k of parsed.keys) {
       if (k) {
@@ -428,12 +430,13 @@ export async function listExistingKeys(
   return keys;
 }
 
-// The aws cli, when given both --query and --max-items, prints the queried
-// array followed by a separate line with the pagination token, e.g.
-//   [ "a/x.tar.gz", "a/y.tar.gz" ]
-//   NEXT_TOKEN_STRING
-// Older/other configs may emit a single JSON doc. Handle both: pull any JSON
-// array of strings for keys, and any trailing non-JSON line as the token.
+// Parse one page of `s3api list-objects-v2 --output json` output. The raw
+// response is a JSON object: { "Contents": [ { "Key": ... }, ... ],
+// "NextToken": "..." }. When the result is truncated by --max-items the CLI
+// injects a top-level "NextToken" we resume from; when exhausted there is no
+// NextToken. We deliberately parse the full document (rather than a
+// --query-projected array) because a JMESPath query drops the injected
+// NextToken and silently caps pagination at the first page.
 export function parseListPage(stdout: string): {
   keys: string[];
   nextToken: string | undefined;
@@ -443,27 +446,29 @@ export function parseListPage(stdout: string): {
     return { keys: [], nextToken: undefined };
   }
 
-  const start = text.indexOf('[');
-  const end = text.lastIndexOf(']');
-  let keys: string[] = [];
-  if (start !== -1 && end !== -1 && end > start) {
-    try {
-      const arr = JSON.parse(text.slice(start, end + 1)) as unknown;
-      if (Array.isArray(arr)) {
-        keys = arr.filter((x): x is string => typeof x === 'string');
-      }
-    } catch {
-      keys = [];
-    }
+  let doc: unknown;
+  try {
+    doc = JSON.parse(text);
+  } catch {
+    return { keys: [], nextToken: undefined };
   }
 
-  // Anything after the array (the CLI prints the pagination token on its own
-  // line) is the next token. A bare "None" means no more pages.
-  let nextToken: string | undefined;
-  const after = end !== -1 ? text.slice(end + 1).trim() : '';
-  if (after && after !== 'None') {
-    nextToken = after.split(/\s+/).pop();
+  const obj = (doc ?? {}) as { Contents?: unknown; NextToken?: unknown };
+
+  let keys: string[] = [];
+  if (Array.isArray(obj.Contents)) {
+    keys = obj.Contents.map((c) =>
+      c && typeof c === 'object' ? (c as { Key?: unknown }).Key : undefined
+    ).filter((k): k is string => typeof k === 'string');
   }
+
+  // A NextToken is present only while the listing is truncated. An empty
+  // string or missing field means there are no more pages.
+  const nextToken =
+    typeof obj.NextToken === 'string' && obj.NextToken
+      ? obj.NextToken
+      : undefined;
+
   return { keys, nextToken };
 }
 

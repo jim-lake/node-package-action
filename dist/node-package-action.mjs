@@ -34210,9 +34210,7 @@ async function listExistingKeys(s3npmPrefix) {
       "--bucket",
       bucket,
       "--output",
-      "json",
-      "--query",
-      "Contents[].Key"
+      "json"
     ];
     if (prefix) {
       args.push("--prefix", prefix + "/");
@@ -34244,24 +34242,20 @@ function parseListPage(stdout) {
   if (!text) {
     return { keys: [], nextToken: void 0 };
   }
-  const start = text.indexOf("[");
-  const end = text.lastIndexOf("]");
+  let doc;
+  try {
+    doc = JSON.parse(text);
+  } catch {
+    return { keys: [], nextToken: void 0 };
+  }
+  const obj = doc ?? {};
   let keys = [];
-  if (start !== -1 && end !== -1 && end > start) {
-    try {
-      const arr = JSON.parse(text.slice(start, end + 1));
-      if (Array.isArray(arr)) {
-        keys = arr.filter((x) => typeof x === "string");
-      }
-    } catch {
-      keys = [];
-    }
+  if (Array.isArray(obj.Contents)) {
+    keys = obj.Contents.map(
+      (c) => c && typeof c === "object" ? c.Key : void 0
+    ).filter((k) => typeof k === "string");
   }
-  let nextToken;
-  const after = end !== -1 ? text.slice(end + 1).trim() : "";
-  if (after && after !== "None") {
-    nextToken = after.split(/\s+/).pop();
-  }
+  const nextToken = typeof obj.NextToken === "string" && obj.NextToken ? obj.NextToken : void 0;
   return { keys, nextToken };
 }
 async function mirrorGitSpec(item, s3npmPrefix, existingKeys) {
