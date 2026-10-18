@@ -34053,7 +34053,7 @@ async function handleCode({
   await fs$1.writeFile(commit_file, context.sha);
   const list = Array.isArray(files) ? files : [files];
   await Qn({ cwd, gzip: true, file: out_file, filter: tarFilter }, list);
-  await aws(["s3", "cp", out_file, `s3://${s3prefix}/`]);
+  await aws(["s3", "cp", out_file, `s3://${s3prefix}/`], { log: true });
 }
 async function handleShrinkwrap({
   cwd,
@@ -34069,16 +34069,23 @@ async function handleShrinkwrap({
   const seen = /* @__PURE__ */ new Set();
   if (json && json.packages) {
     for (const [pkgKey, pkg] of Object.entries(json.packages)) {
-      if (!pkg || !pkg.resolved) continue;
-      if (omitDev && isDevOnly(pkg)) continue;
-      if (seen.has(pkg.resolved)) continue;
+      if (!pkg || !pkg.resolved) {
+        continue;
+      }
+      if (omitDev && isDevOnly(pkg)) {
+        continue;
+      }
+      if (seen.has(pkg.resolved)) {
+        continue;
+      }
       seen.add(pkg.resolved);
       items.push({ pkgKey, pkg, resolved: pkg.resolved });
     }
   }
+  const existing_keys = await listExistingKeys(s3npmPrefix);
   const mirror_map = /* @__PURE__ */ new Map();
   await mapLimit(items, EACH_LIMIT, async (item) => {
-    const result = await mirrorResolved(item, s3npmPrefix);
+    const result = await mirrorResolved(item, s3npmPrefix, existing_keys);
     if (result) {
       mirror_map.set(item.resolved, result);
     }
@@ -34096,16 +34103,19 @@ async function handleShrinkwrap({
 function isDevOnly(pkg) {
   return pkg.dev === true;
 }
-async function mirrorResolved(item, s3npmPrefix) {
+async function mirrorResolved(item, s3npmPrefix, existingKeys) {
   const url = item.resolved;
+  let result;
   if (isHttpTarball(url)) {
-    return mirrorHttpTarball(item, s3npmPrefix);
+    result = await mirrorHttpTarball(item, s3npmPrefix, existingKeys);
+  } else if (isGitSpec(url)) {
+    result = await mirrorGitSpec(item, s3npmPrefix, existingKeys);
+  } else {
+    info(`mirror: skip (unrecognized) ${url}`);
+    return null;
   }
-  if (isGitSpec(url)) {
-    return mirrorGitSpec(item, s3npmPrefix);
-  }
-  info("mirrorResolved: skip (unrecognized): " + url);
-  return null;
+  info(`mirror: ${result.action} ${item.pkgKey} -> ${result.key}`);
+  return result;
 }
 function isHttpTarball(url) {
   return /^https?:\/\//.test(url);
@@ -34113,7 +34123,7 @@ function isHttpTarball(url) {
 function isGitSpec(url) {
   return /^git\+/.test(url) || /^git:\/\//.test(url) || /^(github|gitlab|bitbucket|gist):/.test(url);
 }
-async function mirrorHttpTarball(item, s3npmPrefix) {
+async function mirrorHttpTarball(item, s3npmPrefix, existingKeys) {
   const url = item.resolved;
   const res = await fetch(url);
   if (!res.ok) {
@@ -34121,17 +34131,21 @@ async function mirrorHttpTarball(item, s3npmPrefix) {
   }
   const buf = Buffer.from(await res.arrayBuffer());
   verifyIntegrity(item.pkg.integrity, buf, url);
-  return storeTarball(buf, s3npmPrefix);
+  return storeTarball(buf, s3npmPrefix, existingKeys);
 }
 function verifyIntegrity(sri, buf, url) {
-  if (!sri) return;
+  if (!sri) {
+    return;
+  }
   const entries = sri.trim().split(/\s+/).map((s) => {
     const dash = s.indexOf("-");
     return dash === -1 ? null : { alg: s.slice(0, dash), b64: s.slice(dash + 1) };
   }).filter((e) => e !== null);
   for (const alg of ["sha512", "sha256", "sha1"]) {
     const entry = entries.find((e) => e.alg === alg);
-    if (!entry) continue;
+    if (!entry) {
+      continue;
+    }
     const actual = crypto$1.createHash(alg).update(buf).digest("base64");
     if (actual !== entry.b64) {
       throw new Error(
@@ -34141,38 +34155,31 @@ function verifyIntegrity(sri, buf, url) {
     return;
   }
 }
-async function storeTarball(buf, s3npmPrefix) {
+async function storeTarball(buf, s3npmPrefix, existingKeys) {
   const digest = crypto$1.createHash("sha512").update(buf).digest();
   const hex = digest.toString("hex");
   const b64 = digest.toString("base64");
   const key = hex + ".tar.gz";
-  await putContentAddressed({ buf, key, checksumB64: b64, s3npmPrefix });
-  return { key, integrity: "sha512-" + b64 };
+  const action = await putContentAddressed({
+    buf,
+    key,
+    checksumB64: b64,
+    s3npmPrefix,
+    existingKeys
+  });
+  return { key, integrity: "sha512-" + b64, action };
 }
 async function putContentAddressed({
   buf,
   key,
   checksumB64,
-  s3npmPrefix
+  s3npmPrefix,
+  existingKeys
 }) {
   const [bucket, ...prefixParts] = s3npmPrefix.split("/");
   const fullKey = [...prefixParts, key].filter(Boolean).join("/");
-  const exists2 = await aws(
-    [
-      "s3api",
-      "head-object",
-      "--bucket",
-      bucket,
-      "--key",
-      fullKey,
-      "--output",
-      "text"
-    ],
-    { ignoreError: true }
-  );
-  if (exists2.ok) {
-    info(`storeTarball: skip (exists): ${fullKey}`);
-    return;
+  if (existingKeys.has(fullKey)) {
+    return "skipped";
   }
   const tmp = R.join(await fs$1.mkdtemp(R.join(temp_dir, "put-")), key);
   await fs$1.writeFile(tmp, buf);
@@ -34188,9 +34195,76 @@ async function putContentAddressed({
     "--checksum-sha512",
     checksumB64
   ]);
-  info(`storeTarball: uploaded: ${fullKey}`);
+  existingKeys.add(fullKey);
+  return "uploaded";
 }
-async function mirrorGitSpec(item, s3npmPrefix) {
+async function listExistingKeys(s3npmPrefix) {
+  const [bucket, ...prefixParts] = s3npmPrefix.split("/");
+  const prefix = prefixParts.filter(Boolean).join("/");
+  const keys = /* @__PURE__ */ new Set();
+  let token;
+  do {
+    const args = [
+      "s3api",
+      "list-objects-v2",
+      "--bucket",
+      bucket,
+      "--output",
+      "json",
+      "--query",
+      "Contents[].Key"
+    ];
+    if (prefix) {
+      args.push("--prefix", prefix + "/");
+    }
+    if (token) {
+      args.push("--starting-token", token);
+    }
+    args.push("--max-items", "1000");
+    const res = await aws(args, { ignoreError: true });
+    if (!res.ok) {
+      info(
+        `listExistingKeys: list failed (${res.code}); assuming empty mirror`
+      );
+      return keys;
+    }
+    const parsed = parseListPage(res.stdout);
+    for (const k of parsed.keys) {
+      if (k) {
+        keys.add(k);
+      }
+    }
+    token = parsed.nextToken;
+  } while (token);
+  info(`listExistingKeys: ${keys.size} objects already mirrored`);
+  return keys;
+}
+function parseListPage(stdout) {
+  const text = (stdout || "").trim();
+  if (!text) {
+    return { keys: [], nextToken: void 0 };
+  }
+  const start = text.indexOf("[");
+  const end = text.lastIndexOf("]");
+  let keys = [];
+  if (start !== -1 && end !== -1 && end > start) {
+    try {
+      const arr = JSON.parse(text.slice(start, end + 1));
+      if (Array.isArray(arr)) {
+        keys = arr.filter((x) => typeof x === "string");
+      }
+    } catch {
+      keys = [];
+    }
+  }
+  let nextToken;
+  const after = end !== -1 ? text.slice(end + 1).trim() : "";
+  if (after && after !== "None") {
+    nextToken = after.split(/\s+/).pop();
+  }
+  return { keys, nextToken };
+}
+async function mirrorGitSpec(item, s3npmPrefix, existingKeys) {
   const url = item.resolved;
   const pack_dir = await fs$1.mkdtemp(R.join(temp_dir, "gitpack-"));
   try {
@@ -34216,7 +34290,7 @@ async function mirrorGitSpec(item, s3npmPrefix) {
       packed = R.join(pack_dir, entries[0]);
     }
     const buf = await fs$1.readFile(packed);
-    return await storeTarball(buf, s3npmPrefix);
+    return await storeTarball(buf, s3npmPrefix, existingKeys);
   } finally {
     await fs$1.rm(pack_dir, { recursive: true, force: true });
   }
@@ -34233,9 +34307,13 @@ async function rewriteShrinkwrapInPlace({
   let count = 0;
   if (rewritten.packages) {
     for (const value of Object.values(rewritten.packages)) {
-      if (!value || !value.resolved) continue;
+      if (!value || !value.resolved) {
+        continue;
+      }
       const info = mirror_map.get(value.resolved);
-      if (!info) continue;
+      if (!info) {
+        continue;
+      }
       value.resolved = base + "/" + info.key;
       if (info.integrity) {
         value.integrity = info.integrity;
@@ -34250,16 +34328,25 @@ async function rewriteShrinkwrapInPlace({
 }
 async function updateLatest({ s3prefix }) {
   await fs$1.writeFile(latest_file, context.sha);
-  await aws(["s3", "cp", latest_file, `s3://${s3prefix}/`]);
+  await aws(["s3", "cp", latest_file, `s3://${s3prefix}/`], { log: true });
 }
-async function aws(args, { ignoreError = false } = {}) {
-  info("aws " + args.join(" "));
+async function aws(args, {
+  ignoreError = false,
+  log = false
+} = {}) {
+  if (log) {
+    info("aws " + args.join(" "));
+  }
   try {
     const { stdout, stderr } = await execFileAsync("aws", args, {
       maxBuffer: 32 * 1024 * 1024
     });
-    if (stdout) process.stdout.write(stdout);
-    if (stderr) process.stderr.write(stderr);
+    if (log && stdout) {
+      process.stdout.write(stdout);
+    }
+    if (log && stderr) {
+      process.stderr.write(stderr);
+    }
     return { ok: true, stdout, stderr, code: 0 };
   } catch (err) {
     if (ignoreError) {
@@ -34280,7 +34367,9 @@ async function mapLimit(items, limit, fn) {
   const run = async () => {
     for (; ; ) {
       const next = queue.shift();
-      if (!next) return;
+      if (!next) {
+        return;
+      }
       await fn(next[1], next[0]);
     }
   };
@@ -34308,4 +34397,4 @@ if (import.meta.main) {
   });
 }
 
-export { handleShrinkwrap, isDevOnly, isGitSpec, isHttpTarball, verifyIntegrity };
+export { handleShrinkwrap, isDevOnly, isGitSpec, isHttpTarball, listExistingKeys, parseListPage, verifyIntegrity };

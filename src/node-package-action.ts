@@ -37,11 +37,13 @@ interface MirrorItem {
   resolved: string;
 }
 
-// The outcome of mirroring one dependency: its content-addressed key and the
-// (possibly updated) SRI integrity string.
+// The outcome of mirroring one dependency: its content-addressed key, the
+// (possibly updated) SRI integrity string, and whether the bytes were newly
+// uploaded or already present in the mirror.
 interface MirrorResult {
   key: string;
   integrity: string;
+  action: 'skipped' | 'uploaded';
 }
 
 interface HandleShrinkwrapOptions {
@@ -124,7 +126,7 @@ async function handleCode({
   const list = Array.isArray(files) ? files : [files];
   await tar.c({ cwd, gzip: true, file: out_file, filter: tarFilter }, list);
 
-  await aws(['s3', 'cp', out_file, `s3://${s3prefix}/`]);
+  await aws(['s3', 'cp', out_file, `s3://${s3prefix}/`], { log: true });
 }
 
 export async function handleShrinkwrap({
@@ -160,13 +162,22 @@ export async function handleShrinkwrap({
     }
   }
 
+  // List every object already in the mirror prefix ONCE, up front, with a
+  // single paginated list-objects-v2 call. Mirror keys are content-addressed
+  // (identical content => identical key), so membership in this set is an
+  // exact "already uploaded" check. This replaces the old per-package
+  // `s3api head-object` spawn (one aws process + round-trip per dependency),
+  // which was the dominant cost for large lockfiles.
+  const existing_keys = await listExistingKeys(s3npmPrefix);
+
   // Mirror each unique dependency to S3, content-addressed by sha512, with
-  // bounded concurrency. Each upload skips when the object already exists
-  // (identical content => identical key) and verifies the bytes via S3's
-  // native sha512 checksum on write.
+  // bounded concurrency. Each upload skips when its key is already in
+  // existing_keys and verifies the bytes via S3's native sha512 checksum on
+  // write. Newly uploaded keys are added to the set so two items that resolve
+  // to identical bytes in the same run don't double-upload.
   const mirror_map = new Map<string, MirrorResult>();
   await mapLimit(items, EACH_LIMIT, async (item) => {
-    const result = await mirrorResolved(item, s3npmPrefix);
+    const result = await mirrorResolved(item, s3npmPrefix, existing_keys);
     if (result) {
       mirror_map.set(item.resolved, result);
     }
@@ -189,20 +200,25 @@ export function isDevOnly(pkg: LockfilePackage): boolean {
   return pkg.dev === true;
 }
 
-// Classify a resolved spec and mirror it. Returns { key, integrity } or null.
+// Classify a resolved spec and mirror it. Emits exactly one log line per
+// package summarizing the outcome. Returns { key, integrity, action } or null.
 async function mirrorResolved(
   item: MirrorItem,
-  s3npmPrefix: string
+  s3npmPrefix: string,
+  existingKeys: Set<string>
 ): Promise<MirrorResult | null> {
   const url = item.resolved;
+  let result: MirrorResult | null;
   if (isHttpTarball(url)) {
-    return mirrorHttpTarball(item, s3npmPrefix);
+    result = await mirrorHttpTarball(item, s3npmPrefix, existingKeys);
+  } else if (isGitSpec(url)) {
+    result = await mirrorGitSpec(item, s3npmPrefix, existingKeys);
+  } else {
+    core.info(`mirror: skip (unrecognized) ${url}`);
+    return null;
   }
-  if (isGitSpec(url)) {
-    return mirrorGitSpec(item, s3npmPrefix);
-  }
-  core.info('mirrorResolved: skip (unrecognized): ' + url);
-  return null;
+  core.info(`mirror: ${result.action} ${item.pkgKey} -> ${result.key}`);
+  return result;
 }
 
 export function isHttpTarball(url: string): boolean {
@@ -223,7 +239,8 @@ export function isGitSpec(url: string): boolean {
 // integrity to disagree.
 async function mirrorHttpTarball(
   item: MirrorItem,
-  s3npmPrefix: string
+  s3npmPrefix: string,
+  existingKeys: Set<string>
 ): Promise<MirrorResult> {
   const url = item.resolved;
 
@@ -237,7 +254,7 @@ async function mirrorHttpTarball(
   // served different bytes than the lockfile expects -> hard error.
   verifyIntegrity(item.pkg.integrity, buf, url);
 
-  return storeTarball(buf, s3npmPrefix);
+  return storeTarball(buf, s3npmPrefix, existingKeys);
 }
 
 // Compare downloaded bytes against a Subresource Integrity string from the
@@ -288,51 +305,50 @@ export function verifyIntegrity(
 // re-encodings of the same digest).
 async function storeTarball(
   buf: Buffer,
-  s3npmPrefix: string
+  s3npmPrefix: string,
+  existingKeys: Set<string>
 ): Promise<MirrorResult> {
   const digest = crypto.createHash('sha512').update(buf).digest();
   const hex = digest.toString('hex');
   const b64 = digest.toString('base64');
   const key = hex + '.tar.gz';
 
-  await putContentAddressed({ buf, key, checksumB64: b64, s3npmPrefix });
+  const action = await putContentAddressed({
+    buf,
+    key,
+    checksumB64: b64,
+    s3npmPrefix,
+    existingKeys,
+  });
 
-  return { key, integrity: 'sha512-' + b64 };
+  return { key, integrity: 'sha512-' + b64, action };
 }
 
-// head-then-put: skip when the key already exists (content-addressed, so an
-// existing object is byte-identical), otherwise upload with S3's native
-// sha512 checksum so the service verifies the bytes on write.
+// list-check-then-put: skip when the key is already present in the mirror
+// (content-addressed, so an existing object is byte-identical), otherwise
+// upload with S3's native sha512 checksum so the service verifies the bytes
+// on write. existingKeys is the set of full keys discovered by the single
+// up-front list-objects-v2 call; a newly uploaded key is recorded there so a
+// later item with identical bytes in the same run short-circuits too.
+// Returns 'skipped' or 'uploaded' so the caller can log one line per package.
 async function putContentAddressed({
   buf,
   key,
   checksumB64,
   s3npmPrefix,
+  existingKeys,
 }: {
   buf: Buffer;
   key: string;
   checksumB64: string;
   s3npmPrefix: string;
-}): Promise<void> {
+  existingKeys: Set<string>;
+}): Promise<'skipped' | 'uploaded'> {
   const [bucket, ...prefixParts] = s3npmPrefix.split('/');
   const fullKey = [...prefixParts, key].filter(Boolean).join('/');
 
-  const exists = await aws(
-    [
-      's3api',
-      'head-object',
-      '--bucket',
-      bucket,
-      '--key',
-      fullKey,
-      '--output',
-      'text',
-    ],
-    { ignoreError: true }
-  );
-  if (exists.ok) {
-    core.info(`storeTarball: skip (exists): ${fullKey}`);
-    return;
+  if (existingKeys.has(fullKey)) {
+    return 'skipped';
   }
 
   // Write to a temp file so put-object can stream it from --body.
@@ -350,7 +366,105 @@ async function putContentAddressed({
     '--checksum-sha512',
     checksumB64,
   ]);
-  core.info(`storeTarball: uploaded: ${fullKey}`);
+  existingKeys.add(fullKey);
+  return 'uploaded';
+}
+
+// List every object key under the mirror prefix with a single paginated
+// list-objects-v2 call (1000 keys per page). Returns a set of full keys
+// (prefix included) so putContentAddressed can test existence in memory
+// instead of spawning an `s3api head-object` per dependency.
+export async function listExistingKeys(
+  s3npmPrefix: string
+): Promise<Set<string>> {
+  const [bucket, ...prefixParts] = s3npmPrefix.split('/');
+  const prefix = prefixParts.filter(Boolean).join('/');
+  const keys = new Set<string>();
+
+  let token: string | undefined;
+  do {
+    const args = [
+      's3api',
+      'list-objects-v2',
+      '--bucket',
+      bucket,
+      '--output',
+      'json',
+      '--query',
+      'Contents[].Key',
+    ];
+    if (prefix) {
+      args.push('--prefix', prefix + '/');
+    }
+    if (token) {
+      args.push('--starting-token', token);
+    }
+    // --max-items keeps the CLI's own pagination in sync with our token loop.
+    args.push('--max-items', '1000');
+
+    const res = await aws(args, { ignoreError: true });
+    if (!res.ok) {
+      // The prefix may not exist yet (first run) or the account may lack
+      // ListBucket. Treat as empty: every object will then be (re)uploaded,
+      // which is safe because put-object + content-addressing is idempotent.
+      core.info(
+        `listExistingKeys: list failed (${res.code}); assuming empty mirror`
+      );
+      return keys;
+    }
+
+    // With --query the CLI prints the array of keys; pagination appends a
+    // trailing NextToken object. Parse defensively.
+    const parsed = parseListPage(res.stdout);
+    for (const k of parsed.keys) {
+      if (k) {
+        keys.add(k);
+      }
+    }
+    token = parsed.nextToken;
+  } while (token);
+
+  core.info(`listExistingKeys: ${keys.size} objects already mirrored`);
+  return keys;
+}
+
+// The aws cli, when given both --query and --max-items, prints the queried
+// array followed by a separate line with the pagination token, e.g.
+//   [ "a/x.tar.gz", "a/y.tar.gz" ]
+//   NEXT_TOKEN_STRING
+// Older/other configs may emit a single JSON doc. Handle both: pull any JSON
+// array of strings for keys, and any trailing non-JSON line as the token.
+export function parseListPage(stdout: string): {
+  keys: string[];
+  nextToken: string | undefined;
+} {
+  const text = (stdout || '').trim();
+  if (!text) {
+    return { keys: [], nextToken: undefined };
+  }
+
+  const start = text.indexOf('[');
+  const end = text.lastIndexOf(']');
+  let keys: string[] = [];
+  if (start !== -1 && end !== -1 && end > start) {
+    try {
+      const arr = JSON.parse(text.slice(start, end + 1)) as unknown;
+      if (Array.isArray(arr)) {
+        keys = arr.filter((x): x is string => typeof x === 'string');
+      }
+    } catch {
+      keys = [];
+    }
+  }
+
+  // Anything after the array (the CLI prints the pagination token on its own
+  // line) is the next token. A bare "None" means no more pages.
+  let nextToken: string | undefined;
+  const after = end !== -1 ? text.slice(end + 1).trim() : '';
+  if (after && after !== 'None') {
+    nextToken = after.split(/\s+/).pop();
+  }
+  return { keys, nextToken };
 }
 
 // Pack a git dependency into a tarball via `npm pack`, compute its sha512, and
@@ -358,7 +472,8 @@ async function putContentAddressed({
 // integrity to verify against, so the computed sha512 is authoritative.
 async function mirrorGitSpec(
   item: MirrorItem,
-  s3npmPrefix: string
+  s3npmPrefix: string,
+  existingKeys: Set<string>
 ): Promise<MirrorResult> {
   const url = item.resolved;
 
@@ -393,7 +508,7 @@ async function mirrorGitSpec(
     }
 
     const buf = await fs.readFile(packed);
-    return await storeTarball(buf, s3npmPrefix);
+    return await storeTarball(buf, s3npmPrefix, existingKeys);
   } finally {
     await fs.rm(pack_dir, { recursive: true, force: true });
   }
@@ -444,25 +559,32 @@ async function rewriteShrinkwrapInPlace({
 
 async function updateLatest({ s3prefix }: { s3prefix: string }): Promise<void> {
   await fs.writeFile(latest_file, context.sha);
-  await aws(['s3', 'cp', latest_file, `s3://${s3prefix}/`]);
+  await aws(['s3', 'cp', latest_file, `s3://${s3prefix}/`], { log: true });
 }
 
 // Run the aws cli with argv (no shell). Returns { ok, stdout, stderr, code }.
 // With { ignoreError: true } a non-zero exit resolves (ok:false) instead of
-// throwing -- used for head-object existence checks.
+// throwing. By default the call is quiet (no command echo, no stdout/stderr
+// passthrough) so the mirror loop can emit a single line per package; pass
+// { log: true } for the handful of top-level calls whose output is useful.
 async function aws(
   args: string[],
-  { ignoreError = false }: { ignoreError?: boolean } = {}
+  {
+    ignoreError = false,
+    log = false,
+  }: { ignoreError?: boolean; log?: boolean } = {}
 ): Promise<AwsResult> {
-  core.info('aws ' + args.join(' '));
+  if (log) {
+    core.info('aws ' + args.join(' '));
+  }
   try {
     const { stdout, stderr } = await execFileAsync('aws', args, {
       maxBuffer: 32 * 1024 * 1024,
     });
-    if (stdout) {
+    if (log && stdout) {
       process.stdout.write(stdout);
     }
-    if (stderr) {
+    if (log && stderr) {
       process.stderr.write(stderr);
     }
     return { ok: true, stdout, stderr, code: 0 };
